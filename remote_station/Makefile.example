@@ -1,0 +1,10 @@
+all: wind.hex
+
+wind.hex: wind.c
+	xc8 --chip=16f88 --opt=all -DISP=\"...\" -DPORT=\"...\" -DSERVER=\"...\" $^
+
+install: wind.hex
+	pk2cmd -K -Y -M -Ppic16f88 -F $< 
+
+clean: 
+	rm -f startup.* funclist *.o *.hex *.lst *.cod *.sym *.sdb *.pre *.p1 *.hxl *.d *.cof

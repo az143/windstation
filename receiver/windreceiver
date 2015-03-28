@@ -1,0 +1,381 @@
+#!/usr/bin/perl
+# 
+#   File:		windreceiver
+#   Date:		11 Apr 2013 17:46:14
+#   Author:		Alexander Zangerl <az@snafu.priv.at>
+# 
+#   Abstract:
+#	rewrite of the windreceiver, display and reaper tools using sqlite
+#
+use strict;
+use SQL::Abstract;
+use DBI;
+use IO::Socket;
+use File::Basename;
+use Sys::Syslog;
+use Proc::PID::File;
+use Getopt::Std;
+use DateTime;
+use Data::Dumper;
+use IO::Select;
+
+# offset (deg) between real N and reported N 
+# port nr is embedded in sensor firmware
+my %conf=("site_one"=>{noffset=>123, port=>4567, tname=>"somewhere"},
+	  "site_two"=>{noffset=>321, port=>7654, tname=>"elsewhere"});
+
+my $facility="local1";
+my $dbfile="/var/lib/wind/observations.db";
+
+my $displaytz="+1000";
+my $datefmt="%a %b %e %H:%M:%S %Y";
+my $timefmt="%H:%M:%S";
+my $maxignhole=60;
+
+my %opts;
+my $usage="Usage:\t$0 -d
+\t$0 [-a <time>] <locname>
+\t$0 [-r]|[-c <secs] [-s] [-t N..M] <locname>
+\t$0 -P <secs> <locname>
+\t$9 -X <secs> <locname>
+-d: daemonize and receive data from net
+-a: show stats at time X
+-r: raw dump
+-c: consolidated dump, averaged over X seconds
+-s: separate at holes
+-t: interval N..M, -D..M, N..+D, N..now, -D..now.
+-P: purge records older than X seconds
+-X: return 0 if records in last X seconds, 2 if not\n";
+die $usage if (!getopts("drsP:a:X:c:t:",\%opts) 
+	       or ($opts{d} && @ARGV) 
+	       or (!$opts{d} && (@ARGV!=1 || !$conf{$ARGV[0]})));
+
+my $db=DBI->connect("dbi:SQLite:dbname=$dbfile");
+die "can't connect to db: $!\n" if (!$db);
+my $sql=SQL::Abstract->new;
+
+for my $tname (map { $_->{tname} } (values %conf))
+{
+    if (!$db->tables(undef,undef,$tname,"TABLE"))
+    {
+	my $res=$db->do(scalar $sql->generate('create table',\$tname,
+					      ["time INTEGER PRIMARY KEY",
+					       "dir REAL NOT NULL",
+					       "speed REAL NOT NULL",
+					       "uptime INTEGER DEFAULT NULL"]));
+	die "can't create table $tname: ".$db->errstr."\n" if (!defined $res);
+    }
+}
+my $now=time;
+
+# net receiver daemon mode first
+if ($opts{d})
+{
+    $0="windreceiver";
+    openlog(basename($0),"pid",$facility);
+    syslog("info","starting up");
+
+    chdir '/' or die "Can't chdir to /: $!";
+    open STDIN, '/dev/null'  or die "Can't read /dev/null: $!";
+    open STDOUT, '>/dev/null' or die "Can't write to /dev/null: $!";
+
+    $SIG{__DIE__}=sub { die @_ if $^S; syslog("crit",$_[0]."\n"); };
+    $SIG{__WARN__}=sub { syslog("crit",$_[0]."\n"); };
+
+    defined(my $pid = fork) or die "Can't fork: $!";
+    exit if $pid;
+
+    my $sockselect=IO::Select->new;
+    my %sock2loc;
+    
+    # prep sockets, reusable db statement handles
+    for my $locname (keys %conf)
+    {
+	# prep udp listening socket
+	my $sock=IO::Socket::INET->new(LocalPort=>$conf{$locname}->{port},
+				       Proto=>"udp")
+	    or die "can't setup socket: $@\n";
+	$sock2loc{$sock}=$locname;
+	$sockselect->add($sock);
+
+	# prep insertion, update and test statement handles (can be reused)
+	my ($stmt,undef)=$sql->insert($conf{$locname}->{tname},
+				      {time=>undef,dir=>undef,speed=>undef,uptime=>undef});
+	$conf{$locname}->{inshandle}=$db->prepare($stmt);
+	# time=>undef is understood as IS NULL, and not a bind!
+	($stmt,undef)=$sql->select($conf{$locname}->{tname},"time",{time=>1});
+	$conf{$locname}->{testhandle}=$db->prepare($stmt);
+	($stmt,undef)=$sql->update($conf{$locname}->{tname},{dir=>undef,speed=>undef,uptime=>undef},
+				   {time=>1});
+	$conf{$locname}->{updhandle}=$db->prepare($stmt);
+    }
+
+    # and now do not stop collecting data
+    while (my @ready=$sockselect->can_read)
+    {
+	for my $sock (@ready)
+	{
+	    my $locname=$sock2loc{$sock};
+	    my $data;
+    
+	    my $otheraddy=recv($sock,$data,9,0);
+	    my $when=time;
+    
+	    # unpack the goodies
+	    my ($uptime,$speed,$dx,@dirsamples)=unpack('nCCCCCCC',$data);
+	    my $packetcrc=pop @dirsamples;
+	    # dirs handed out as: newest, then oldest...secondnewest
+	    push @dirsamples,$dx;
+	
+	    # but first some data sanity checks
+	    my ($crc,@input)=(0,unpack("C8",$data)); 
+	    map { $crc=crc8($_,$crc); } (@input);
+	    if ($crc != $packetcrc)
+	    {
+		syslog("warning",
+		       sprintf("dud crc=%02x, packet: %02x %02x %02x %02x %02x %02x %02x %02x - %02x",
+			       $crc,@input,$packetcrc));
+	    }
+	    else
+	    {
+		$db->begin_work;
+		my %insertion;
+		for my $i (-4..0)
+		{
+		    # store kmh and deg values in db
+		    # davis 7911 specsheet says: 1600rev/hr = 1mile/hr
+		    # thus: 0.4pulse/sec = 1mph, or 1pulse/sec=2.25mph
+		    # 1mph=1.609344kmh, times 2.25=3.621024. count is for 5sec.
+		    $insertion{speed}=$speed*3.621024/5;
+		    $insertion{dir}=($conf{$locname}->{noffset}+(0.5+$dirsamples[4+$i]*360.0/256.0))%360;
+		    $insertion{uptime}=$uptime;
+		    $insertion{time}=$when+$i;
+		    
+		    my $clash=$conf{$locname}->{testhandle}->execute($insertion{time});
+		    if (!$conf{$locname}->{testhandle}->fetchrow_arrayref)
+		    {
+			my $res=$conf{$locname}->{inshandle}->execute($sql->values(\%insertion));
+			warn("can't insert into ".$conf{$locname}->{tname}.": ".$db->errstr."\n") 
+			    if (!$res);
+		    }
+		    else
+		    {
+			my %pruned=%insertion; 
+			delete $pruned{"time"}; # or we'd get the wrong bind values
+			my $res=$conf{$locname}->{updhandle}->execute($sql->values(\%pruned),$insertion{time});
+			warn("can't update ".$conf{$locname}->{tname}.": ".$db->errstr."\n")
+			    if (!$res);
+		    }
+		}
+		$db->commit;
+	    }
+	}
+    }
+    die "socket select failed: $!\n";
+}
+
+my $locname=$ARGV[0];
+my $tname=$conf{$locname}->{tname};
+$opts{t}||="..";		# full dump of everything should be default
+
+# determine newest and oldest entries
+my $limits=$db->selectrow_hashref("select MAX(time) AS end, MIN(time) AS start from $tname",
+				  {MaxRows=>1});
+my ($oldest,$newest)=($limits->{start},$limits->{end});
+
+if ($opts{X})			# aliveness check
+{
+    exit($now-$opts{X}>$newest?2:0);
+}
+# raw dump mode
+elsif ($opts{r})
+{
+    my ($start,$end)=findinterval($oldest,$newest,$opts{t});
+    my %where=(time=>{-between=>[$start,$end]});
+    my ($stmt,@bind)=$sql->select($tname,'*',\%where,{-asc=>'time'});
+    my $res=$db->selectall_arrayref($stmt,{Slice=>{}},@bind);
+    my $prevtime;
+    exit 2 if (!@$res);
+	
+    for my $entry (@$res)
+    {
+	print "\n" if ($opts{s} && defined $prevtime && 
+		       $entry->{time}-$prevtime>$maxignhole);
+	print join("\t",$entry->{time},$entry->{uptime},
+		   $entry->{speed},$entry->{dir})."\n";
+	$prevtime=$entry->{time};
+    }
+}
+# consolidated dump: raw output, but averaged over interval
+elsif ($opts{c})
+{
+    die "dud interval value \"$opts{c}\"!\n" if ($opts{c}<2);
+
+    my ($start,$end)=findinterval($oldest,$newest,$opts{t});
+    my ($previsblank,$recordcount);
+
+    # can reuse statement fine, but order for time bind value is an issue
+    my ($stmt,@bind)=$sql->select($tname,["AVG(time) as time","AVG(speed) as speed",
+					  "AVG(dir) as dir","count(*) as count"],
+				  {time=>{-between=>[123,456]}},{-asc=>'time'});    
+    my $wantreverse=$bind[0]>$bind[1]; # damn sql::abstract...
+
+    my $shandle=$db->prepare($stmt);
+    for (my $intvs=$start;$intvs+$opts{c}<=$end;$intvs+=$opts{c})
+    {
+	@bind=($intvs,$intvs+$opts{c}-1);
+	@bind=reverse @bind if ($wantreverse);
+	$shandle->execute(@bind) or die("cant select: ".$db->errstr."\n");
+	my $res=$shandle->fetchrow_hashref;
+	$recordcount+=$res->{count};
+	if ($res->{count}>0)
+	{
+	    print join("\t",$res->{time},0,$res->{speed},$res->{dir})."\n";
+	    $previsblank=0;
+	}
+	else
+	{
+	    print "\n" if ($opts{s} && !$previsblank);
+	    $previsblank=1;
+	}
+    }
+    exit 2 if (!$recordcount);
+}
+elsif ($opts{P})
+{
+    my ($stmt,@bind)=$sql->delete($tname,{"time"=>{'<=',$now-$opts{P}}});
+    my $res=$db->do($stmt,undef,@bind);
+    die "can't prune $tname: ".$db->errstr."\n" if (!defined $res);
+}
+# display details mode
+else
+{
+    if (defined $opts{a})
+    {
+	$now=$opts{a};		# specific time
+    }
+    else
+    {				# find latest observation
+	my $latest=$db->selectrow_hashref("select MAX(time) AS time from $tname",
+					  {MaxRows=>1});
+	$now=$latest->{time};
+	if (!defined $now)
+	{
+	    print "no entries.\n";
+	    exit 2;
+	}
+    }
+
+    # compute averages and maxima for: 1 min, 5 min, 20 min and 60 minutes.
+    # direction for maxima is averaged for -15..+15 seconds around max
+    for (["one minute",60],["five minutes",300],
+	 ["twenty minutes",1200],["one hour",3600])
+    {
+	my ($name,$delta)=@$_;
+
+	# ask for the avg
+	my ($stmt,@bind)=$sql->select($tname,['AVG(dir) AS dir',
+					      'AVG(speed) AS speed','COUNT(*) AS count'],
+				      {"time"=>{">",$now-$delta,"<=",$now}});
+	my $res=$db->selectrow_hashref($stmt,{MaxRows=>1},@bind);
+	if (!$res->{count})
+	{
+	    print "no entries.\n";
+	    last;
+	}
+	elsif ($delta==60)	# only print that heading once
+	{
+	    my $dtn=DateTime->from_epoch(epoch=>$now,time_zone=>$displaytz);
+	    print "newest reading: ".$dtn->strftime($datefmt)." ("
+		.(time-$now)." seconds ago)\n";
+	}
+
+	# ask for the max and when
+	($stmt,@bind)=$sql->select($tname,['time','speed'],
+				   {"time"=>{">",$now-$delta,"<=",$now}},
+				   {-desc=>'speed'});
+	my ($maxres)=$db->selectrow_hashref($stmt,{MaxRows=>1},@bind);
+	print "$name (".$res->{count}." records):\n";
+
+	my $maxwhen=$maxres->{time};
+	my $avgdir;
+
+	# find 30s avg of directions around max when
+	if ($maxwhen)
+	{
+	    my ($stmt,@bind)=$sql->select($tname,'AVG(dir) as dir',
+					  {time=>{">=",$maxwhen-15,"<=",$maxwhen+15}});
+	    my $resavgdir=$db->selectall_arrayref($stmt,{Slice=>{},MaxRows=>1},@bind);
+	    $avgdir=$resavgdir->[0]->{dir};
+	}
+	
+	printf("average:\t\t%.2f kmh = %.2f kt, from %d deg = %s\n",
+	       $res->{speed},$res->{speed}/1.852,
+	       $res->{dir},deg2name($res->{dir}));
+	printf("max, at %s:\t%.2f kmh = %.2f kt, from %d deg = %s\n",
+	       DateTime->from_epoch(epoch=>$maxwhen,
+				    time_zone=>$displaytz)->strftime($timefmt),
+	       $maxres->{speed},$maxres->{speed}/1.852,$avgdir,
+	       deg2name($avgdir)) if ($maxres);
+	print "\n";
+    }
+}
+$db->disconnect or die "can't close db: ".$db->errstr."\n";
+exit 0;
+
+sub crc8
+{
+    my ($in,$crc)=@_;
+    
+    my $i=($in ^ $crc) & 0xff;
+    $crc=0;
+    
+    $crc ^= 0x5e if($i & 1);
+    $crc ^= 0xbc if($i & 2);
+    $crc ^= 0x61 if($i & 4);
+    $crc ^= 0xc2 if($i & 8);
+    $crc ^= 0x9d if($i & 0x10);
+    $crc ^= 0x23 if($i & 0x20);
+    $crc ^= 0x46 if($i & 0x40);
+    $crc ^= 0x8c if($i & 0x80);
+    return $crc;
+}
+
+
+
+sub deg2name
+{
+    my ($deg)=@_;
+
+    my @names=(qw(N NNE NE ENE E ESE SE SSE S SSW SW WSW W WNW NW NNW));
+    my $i=int(($deg*16/360)+.5)%16;
+    return $names[$i];
+}
+
+
+# NNN..MMM or -XY..MMM or NNN..+XY or NNN..now or -XY..now
+# missing NNN means from the oldest, missing MMM means to the newest
+# .. can't be left out
+# returns interval start and end, (0,0) if dud spec
+sub findinterval
+{
+    my ($oldest,$newest,$intspec)=@_;
+    my ($start,$end);
+
+    return (0,0) if ($intspec!~/^((-)?\d+)?\.\.((\+)?\d+|now)?$/);
+    $start=$1||$oldest; $end=($3 eq "now"?$now:$3||$newest);
+
+    my ($relstart,$relend)=($2,$4);
+    return (0,0) if ($relstart && $relend); # two relatives can't work
+    
+    $start+=$end if ($relstart); # negative sign is present
+    $end+=$start if ($relend);
+
+    return ($start,$end);
+}
+    
+	
+
+	
+
+    

@@ -1,0 +1,55 @@
+# direction and speed plotted separately, atop each other - last 24 hours
+# 
+# input: straight dump from windreceiver, in file plotdata
+# created by this command (or similar):
+#
+# NOW=`date +%s` EXTRA=$(($NOW%7200)) windreceiver -c 60 \
+#  -s -t -$((86400+$EXTRA)) $STATIONCODE > plotdata
+#
+# required env variables: $NOW is timestamp of newest record,
+# $TZOFFSET timezone offset for localization,
+# $OUTPUT target file
+
+set terminal png enhanced font "Vera,10"
+set output `echo $OUTPUT`
+now = `echo $NOW`
+tzo = `echo $TZOFFSET`
+
+set timefmt "%s" 
+set xdata time
+set xtics 7200
+# gnuplot in wheezy is dud?
+# set xrange [now+tzo-86400:now+tzo]
+
+set grid
+
+set format x "%k"
+set datafile separator "\t"
+unset key
+
+set multiplot layout 2,1 title "Your Station Wind Last 24 Hours"
+set lmargin 8 # to ensure axes line up precisely
+set rmargin 8
+
+set yrange [0:360]
+set ytics ("N" 0, "NE" 45, "E" 90, "SE" 135, "S" 180, "SW" 225, "W" 270, "NW" 315, "N" 360)
+set y2tics ("N" 0, "NE" 45, "E" 90, "SE" 135, "S" 180, "SW" 225, "W" 270, "NW" 315, "N" 360)
+
+# 4 purple
+plot "plotdata" using ($1+tzo):4 title "direction" with lines lc 4
+
+# second plot: setup
+set ylabel "knots"
+set y2label "knots"
+set autoscale y
+unset ytics
+set ytics
+unset y2tics
+set y2tics
+
+# fixme
+# plot "" using ($1+tzo):($3/1.852) title "speed" smooth csplines with lines lc rgb "orange"
+plot "" using ($1+tzo):($3/1.852) title "speed" with lines lc rgb "orange"
+
+unset multiplot
+

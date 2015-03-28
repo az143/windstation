@@ -1,0 +1,54 @@
+# -*- conf -*-
+# direction and speed plotted separately, atop each other - last 2 hours
+# 
+# input: straight dump from windreceiver, in file plotdata
+# created by this command (or similar):
+#
+# NOW=`date +%s` EXTRA=$(($NOW%900)) windreceiver -c 15 \
+#  -s -t -$((7200+$EXTRA))..now $STATIONCODE > plotdata
+#
+# required env variables: $NOW is timestamp of newest record,
+# $TZOFFSET timezone offset for localization,
+# $OUTPUT target file
+
+set terminal png enhanced font "Vera,10"
+set output `echo $OUTPUT`
+now = `echo $NOW`
+tzo = `echo $TZOFFSET`
+
+set timefmt "%s" 
+set xdata time
+set xtics 900
+# gnuplot in wheezy is a bit dumb?
+# set xrange [now+tzo-7200:now+tzo]
+
+set grid
+
+set format x "%H:%M"
+set datafile separator "\t"
+unset key
+
+set multiplot layout 2,1 title "Your Station Wind Last 2 Hours"
+set lmargin 8 # to ensure axes line up precisely
+set rmargin 8
+
+set yrange [0:360]
+set ytics ("N" 0, "NE" 45, "E" 90, "SE" 135, "S" 180, "SW" 225, "W" 270, "NW" 315, "N" 360)
+set y2tics ("N" 0, "NE" 45, "E" 90, "SE" 135, "S" 180, "SW" 225, "W" 270, "NW" 315, "N" 360)
+
+plot "plotdata" using ($1+tzo):4 title "direction" with lines lc 2
+
+
+# second plot: setup
+set ylabel "knots"
+set y2label "knots"
+set autoscale y
+unset ytics
+set ytics
+unset y2tics
+set y2tics
+
+plot "" using ($1+tzo):($3/1.852) title "speed" with lines lc 8
+
+unset multiplot
+
